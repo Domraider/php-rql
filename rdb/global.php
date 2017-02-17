@@ -84,7 +84,7 @@ use r\ValuedQuery\RObject;
 
 function connect($optsOrHost = null, $port = null, $db = null, $apiKey = null, $timeout = null)
 {
-    return new Connection($optsOrHost, $port, $db, $apiKey, $timeout);
+     return (new Connection($optsOrHost, $port, $db, $apiKey, $timeout))->connect();
 }
 
 function db($dbName)

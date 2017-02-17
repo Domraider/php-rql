@@ -2,6 +2,7 @@
 
 namespace r;
 
+use EventLoop\EventLoop;
 use r\DatumConverter;
 use r\Handshake;
 use r\Queries\Dbs\Db;
@@ -11,9 +12,22 @@ use r\Exceptions\RqlServerError;
 use r\Exceptions\RqlDriverError;
 use r\ProtocolBuffer\VersionDummyVersion;
 use r\ProtocolBuffer\VersionDummyProtocol;
+use Rx\Observable;
+use Rx\Observer\AutoDetachObserver;
+use Rx\Observer\CallbackObserver;
+use Rx\ObserverInterface;
+use Rx\Subject\Subject;
+use Rxnet\Connector\Tcp;
+use Rxnet\Connector\Tls;
+use Rxnet\Event\ConnectorEvent;
+use Rxnet\Event\Event;
+use Rxnet\Stream\StreamEvent;
+use Rxnet\Transport\BufferedStream;
+use Rxnet\Transport\Stream;
 
 class Connection extends DatumConverter
 {
+    /** @var  Stream */
     private $socket;
     private $host;
     private $port;
@@ -23,6 +37,7 @@ class Connection extends DatumConverter
     private $activeTokens;
     private $timeout;
     private $ssl;
+    private $loop;
 
     public $defaultDbName;
 
@@ -31,8 +46,11 @@ class Connection extends DatumConverter
         $port = null,
         $db = null,
         $apiKey = null,
-        $timeout = null
-    ) {
+        $timeout = null,
+        EventLoop $loop = null
+    )
+    {
+        $this->loop = ($loop) ?: EventLoop::getLoop();
         if (is_array($optsOrHost)) {
             $opts = $optsOrHost;
             $host = null;
@@ -114,8 +132,6 @@ class Connection extends DatumConverter
         if (isset($timeout)) {
             $this->setTimeout($timeout);
         }
-
-        $this->connect();
     }
 
     public function __destruct()
@@ -134,10 +150,8 @@ class Connection extends DatumConverter
         if ($noreplyWait) {
             $this->noreplyWait();
         }
+        $this->socket->close();
 
-        fclose($this->socket);
-        $this->socket = null;
-        $this->activeTokens = null;
     }
 
     public function reconnect($noreplyWait = true)
@@ -182,14 +196,13 @@ class Connection extends DatumConverter
 
         // Send the request
         $jsonQuery = array(QueryQueryType::PB_NOREPLY_WAIT);
-        $this->sendQuery($token, $jsonQuery);
+        return $this->sendQuery($token, $jsonQuery)
+            ->map(function ($response) {
 
-        // Await the response
-        $response = $this->receiveResponse($token);
-
-        if ($response['t'] != ResponseResponseType::PB_WAIT_COMPLETE) {
-            throw new RqlDriverError("Unexpected response type to noreplyWait query.");
-        }
+                if ($response['t'] != ResponseResponseType::PB_WAIT_COMPLETE) {
+                    throw new RqlDriverError("Unexpected response type to noreplyWait query.");
+                }
+            });
     }
 
     public function server()
@@ -249,29 +262,24 @@ class Connection extends DatumConverter
             (Object)$globalOptargs
         );
 
-        $this->sendQuery($token, $jsonQuery);
+        return $this->sendQuery($token, $jsonQuery)
+            ->map(function ($response) use ($token, $toNativeOptions, &$profile) {
+                if (isset($options['noreply']) && $options['noreply'] === true) {
+                    return null;
+                }
+                if ($response['t'] == ResponseResponseType::PB_SUCCESS_PARTIAL) {
+                    $this->activeTokens[$token] = true;
+                }
 
-        if (isset($options['noreply']) && $options['noreply'] === true) {
-            return null;
-        }
+                if (isset($response['p'])) {
+                    $profile = $this->decodedJSONToDatum($response['p'])->toNative($toNativeOptions);
+                }
 
-        // Await the response
-        $response = $this->receiveResponse($token, $query);
-
-        if ($response['t'] == ResponseResponseType::PB_SUCCESS_PARTIAL) {
-            $this->activeTokens[$token] = true;
-        }
-
-        if (isset($response['p'])) {
-            $profile = $this->decodedJSONToDatum($response['p'])->toNative($toNativeOptions);
-        }
-
-        if ($response['t'] == ResponseResponseType::PB_SUCCESS_ATOM) {
-            return $this->createDatumFromResponse($response)->toNative($toNativeOptions);
-        } else {
-            return $this->createCursorFromResponse($response, $token, $response['n'], $toNativeOptions);
-        }
-
+                if ($response['t'] == ResponseResponseType::PB_SUCCESS_ATOM) {
+                    return $this->createDatumFromResponse($response)->toNative($toNativeOptions);
+                }
+                return $this->createCursorFromResponse($response, $token, $response['n'], $toNativeOptions);
+            });
     }
 
     public function continueQuery($token)
@@ -285,16 +293,13 @@ class Connection extends DatumConverter
 
         // Send the request
         $jsonQuery = array(QueryQueryType::PB_CONTINUE);
-        $this->sendQuery($token, $jsonQuery);
-
-        // Await the response
-        $response = $this->receiveResponse($token);
-
-        if ($response['t'] != ResponseResponseType::PB_SUCCESS_PARTIAL) {
-            unset($this->activeTokens[$token]);
-        }
-
-        return $response;
+        return $this->sendQuery($token, $jsonQuery)
+            ->map(function ($response) use ($token) {
+                if ($response['t'] != ResponseResponseType::PB_SUCCESS_PARTIAL) {
+                    unset($this->activeTokens[$token]);
+                }
+                return $response;
+            });
     }
 
     public function stopQuery($token)
@@ -308,14 +313,13 @@ class Connection extends DatumConverter
 
         // Send the request
         $jsonQuery = array(QueryQueryType::PB_STOP);
-        $this->sendQuery($token, $jsonQuery);
-
-        // Await the response (but don't check for errors. the stop response doesn't even have a type)
-        $response = $this->receiveResponse($token, null, true);
-
-        unset($this->activeTokens[$token]);
-
-        return $response;
+        return $this->sendQuery($token, $jsonQuery)
+            ->map(function ($response) use ($token) {
+                if ($response['t'] != ResponseResponseType::PB_SUCCESS_PARTIAL) {
+                    unset($this->activeTokens[$token]);
+                }
+                return $response;
+            });
     }
 
     private function generateToken()
@@ -330,32 +334,6 @@ class Connection extends DatumConverter
             throw new RqlDriverError("Unable to generate a unique token for the query.");
         }
         return $token;
-    }
-
-    private function receiveResponse($token, $query = null, $noChecks = false)
-    {
-        $responseHeader = $this->receiveStr(4 + 8);
-        $responseHeader = unpack("Vtoken/Vtoken2/Vsize", $responseHeader);
-        $responseToken = $responseHeader['token'];
-        if ($responseHeader['token2'] != 0) {
-            throw new RqlDriverError("Invalid response from server: Invalid token.");
-        }
-        $responseSize = $responseHeader['size'];
-        $responseBuf = $this->receiveStr($responseSize);
-
-        $response = json_decode($responseBuf);
-        if (json_last_error() != JSON_ERROR_NONE) {
-            throw new RqlDriverError("Unable to decode JSON response (error code " . json_last_error() . ")");
-        }
-        if (!is_object($response)) {
-            throw new RqlDriverError("Invalid response from server: Not an object.");
-        }
-        $response = (array)$response;
-        if (!$noChecks) {
-            $this->checkResponse($response, $responseToken, $token, $query);
-        }
-
-        return $response;
     }
 
     private function checkResponse($response, $responseToken, $token, $query = null)
@@ -402,6 +380,7 @@ class Connection extends DatumConverter
 
     private function sendQuery($token, $json)
     {
+        echo "sendQuery > ";
         // PHP by default loses some precision when encoding floats, so we temporarily
         // bump up the `precision` option to avoid this.
         // The 17 assumes IEEE-754 double precision numbers.
@@ -419,7 +398,79 @@ class Connection extends DatumConverter
 
         $requestSize = pack("V", strlen($request));
         $binaryToken = pack("V", $token) . pack("V", 0);
-        $this->sendStr($binaryToken . $requestSize . $request);
+
+        // Pourquoi deconnexion immédiate ?
+        $subject = new Subject();
+        $dispose = $this->socket
+            ->subscribe($subject);
+
+
+        $responseHeader= null;
+        $responseSize = null;
+        $responseToken = null;
+        // Read headers
+        $subject
+            ->takeWhile(function () use (&$responseSize) {
+                return !$responseSize;
+            })
+            ->subscribeCallback(function (StreamEvent $event) use (&$responseHeader, &$responseToken, &$responseSize) {
+                $responseHeader .= $event->getData();
+                echo "header > $responseHeader ";
+                if (strlen($responseHeader) >= 4 + 8) {
+                    // Disconnect first subject
+                    $responseHeader = unpack("Vtoken/Vtoken2/Vsize", $responseHeader);
+                    var_dump($responseHeader);
+                    $responseToken = $responseHeader['token'];
+                    if ($responseHeader['token2'] != 0) {
+                        throw new RqlDriverError("Invalid response from server: Invalid token.");
+                    }
+                    echo "header {$responseSize} > ";
+                    $responseSize = $responseHeader['size'];
+                }
+            });
+        // Read response
+        $query = $binaryToken . $requestSize . $request;
+        $responseBuf = '';
+        $response = '';
+
+        $subject
+            ->skipWhile(function () use (&$responseSize) {
+                return $responseSize;
+            })
+            ->subscribeCallback(function (StreamEvent $event) use ($query, $token, &$response, $responseBuf, &$responseToken, &$responseSize) {
+                $responseBuf .= $event->getData();
+                if (strlen($responseBuf) >= $responseSize) {
+                    echo "response > $responseBuf ";
+                    $responseBuf = json_decode(trim($responseBuf));
+                    var_dump($responseBuf);
+
+                    if (json_last_error() != JSON_ERROR_NONE) {
+                        throw new RqlDriverError("Unable to decode JSON response (error code " . json_last_error() . ")");
+                    }
+                    if (!is_object($responseBuf)) {
+                        throw new RqlDriverError("Invalid response from server: Not an object.");
+                    }
+                    $this->checkResponse((array) $responseBuf, $responseToken, $token, $query);
+
+                    $response = (array)$responseBuf;
+
+                }
+            });
+        // Write to socket
+        echo "write > ";
+        $this->socket->write($query);
+
+        // Wait fo response
+        return $subject
+            ->skipWhile(function () use (&$response) {
+                return $response;
+            })
+            ->map(function () use (&$response, $dispose) {
+                // Unplug from socket read
+                $dispose->dispose();
+                return $response;
+            })
+            ->take(1);
     }
 
     private function applyTimeout($timeout)
@@ -431,11 +482,13 @@ class Connection extends DatumConverter
         }
     }
 
-    private function connect()
+    public function connect()
     {
+
         if ($this->isOpen()) {
             throw new RqlDriverError("Already connected");
         }
+
 
         if ($this->ssl) {
             if (is_array($this->ssl)) {
@@ -443,102 +496,61 @@ class Connection extends DatumConverter
             } else {
                 $context = null;
             }
-            $this->socket = stream_socket_client(
-                "ssl://" . $this->host . ":" . $this->port,
-                $errno,
-                $errstr,
-                ini_get("default_socket_timeout"),
-                STREAM_CLIENT_CONNECT,
-                $context
-            );
-        } else {
-            $this->socket = stream_socket_client("tcp://" . $this->host . ":" . $this->port, $errno, $errstr);
-        }
-        if ($errno != 0 || $this->socket === false) {
-            $this->socket = null;
-            throw new RqlDriverError("Unable to connect: " . $errstr);
-        }
-        if ($this->timeout) {
-            $this->applyTimeout($this->timeout);
-        }
+            $connector = (new Tls($this->loop))
+                ->setContext($context)
+                ->connect($this->host, $this->port);
 
-        $handshake = new Handshake($this->user, $this->password);
-        $handshakeResponse = null;
-        while (true) {
-            if (!$this->isOpen()) {
-                throw new RqlDriverError("Not connected");
-            }
-            try {
-                $msg = $handshake->nextMessage($handshakeResponse);
-            } catch (Exception $e) {
-                $this->close(false);
-                throw $e;
-            }
-            if ($msg === null) {
-                // Handshake is complete
-                break;
-            }
-            if ($msg != "") {
-                $this->sendStr($msg);
-            }
-            // Read null-terminated response
-            $handshakeResponse = "";
-            while (true) {
-                $ch = stream_get_contents($this->socket, 1);
-                if ($ch === false || strlen($ch) < 1) {
-                    $this->close(false);
-                    throw new RqlDriverError("Unable to read from socket during handshake. Disconnected.");
-                }
-                if ($ch === chr(0)) {
-                    break;
-                } else {
-                    $handshakeResponse .= $ch;
-                }
-            }
+        } else {
+            $connector = (new Tcp($this->loop))
+                ->connect($this->host, $this->port);
         }
+        return $connector
+            ->catchError(function (\Exception $e) {
+                throw new RqlDriverError("Unable to connect: " . $e->getMessage());
+            })
+            ->map(function (ConnectorEvent $connectorEvent) {
+                echo "connected > ";
+                $this->socket = $connectorEvent->getStream(); //new BufferedStream($connectorEvent->getStream()->getSocket(), $this->loop);
+                return $connectorEvent;
+            })
+            ->map(function () {
+                $handshakeResponse = null;
+                $handshake = new Handshake($this->user, $this->password);
+                try {
+                    $msg = $handshake->nextMessage($handshakeResponse);
+                } catch (\Exception $e) {
+                    $this->close(false);
+                    throw $e;
+                }
+                return $msg;
+            })
+            ->filter(function ($msg) {
+                return $msg;
+            })
+            ->flatMap(function ($msg) {
+                echo "send > ";
+                $subject = new Subject();
+                $disposable = $this->socket->subscribe($subject);
+
+                $subject
+                    ->take(2)
+                    ->subscribeCallback(
+                        function (StreamEvent $event) {
+                            var_dump("ici", $event->getData());
+                        }, null, [$disposable, 'dispose']);
+                $this->socket->write($msg);
+                return $subject->skip(1);
+            })
+            ->map(function () {
+                echo "identified > ";
+                return $this;
+            });
     }
 
     private function sendStr($s)
     {
-        $bytesWritten = 0;
-        while ($bytesWritten < strlen($s)) {
-            $result = fwrite($this->socket, substr($s, $bytesWritten));
-            if ($result === false || $result === 0) {
-                $metaData = stream_get_meta_data($this->socket);
-                $this->close(false);
-                if ($metaData['timed_out']) {
-                    throw new RqlDriverError(
-                        'Timed out while writing to socket. Disconnected. '
-                        . 'Call setTimeout(seconds) on the connection to change '
-                        . 'the timeout.'
-                    );
-                }
-                throw new RqlDriverError("Unable to write to socket. Disconnected.");
-            }
-            $bytesWritten += $result;
-        }
-    }
 
-    private function receiveStr($length)
-    {
-        $s = "";
-        while (strlen($s) < $length) {
-            $partialS = stream_get_contents($this->socket, $length - strlen($s));
-            if ($partialS === false || feof($this->socket)) {
-                $metaData = stream_get_meta_data($this->socket);
-                $this->close(false);
-                if ($metaData['timed_out']) {
-                    throw new RqlDriverError(
-                        'Timed out while reading from socket. Disconnected. '
-                        . 'Call setTimeout(seconds) on the connection to change '
-                        . 'the timeout.'
-                    );
-                }
-                throw new RqlDriverError("Unable to read from socket. Disconnected.");
-            }
-            $s = $s . $partialS;
-        }
-        return $s;
+
     }
 
     private function convertOptions($options)

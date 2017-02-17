@@ -14,9 +14,11 @@
         }
     ],
     "require": {
-        "php": ">=5.3.0"
+        "php": ">=5.3.0",
+        "domraider/rxnet":"dev-master"
     },
     "require-dev": {
+        "peridot-php/peridot" : "~1.4",
         "phpunit/phpunit": "~4.8",
         "jakub-onderka/php-parallel-lint": "dev-master",
         "squizlabs/php_codesniffer": "~2.5"
