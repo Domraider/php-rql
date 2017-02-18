@@ -6,6 +6,8 @@ require_once('vendor/autoload.php');
  * Date: 16/02/2017
  * Time: 20:33
  */
+$loop = new \React\EventLoop\StreamSelectLoop();
+\EventLoop\EventLoop::setLoop($loop);
 // Connect to localhost
 $conn = \Rxnet\await(r\connect('127.0.0.1', 28015));
 echo " ! Connected !  ";
@@ -22,7 +24,7 @@ r\db("test")
             echo "Table created\n";
         }
     );
-\EventLoop\EventLoop::getLoop()->run();
+$loop->run();
 /*
 
     ->doOnNext(
